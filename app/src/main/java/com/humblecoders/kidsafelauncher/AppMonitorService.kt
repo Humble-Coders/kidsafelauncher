@@ -1,6 +1,5 @@
 package com.humblecoders.kidsafelauncher
 
-import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -18,7 +17,7 @@ import androidx.core.app.NotificationCompat
 class AppMonitorService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
-    private val checkInterval = 500L // Check every 500ms
+    private val checkInterval = 1000L // Check every 1 second (backup to accessibility)
     private var isMonitoring = false
 
     private val monitorRunnable = object : Runnable {
@@ -38,11 +37,9 @@ class AppMonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Start foreground service with notification
         val notification = createNotification()
         startForeground(1, notification)
 
-        // Start monitoring
         isMonitoring = true
         handler.post(monitorRunnable)
 
@@ -57,39 +54,106 @@ class AppMonitorService : Service() {
 
     private fun checkForegroundApp() {
         val currentApp = getForegroundApp()
-
+        
         if (currentApp != null && currentApp != packageName) {
-            // Check if this app is in the whitelist
+            // Always block Settings app - no exceptions
+            if (isSettingsApp(currentApp)) {
+                android.util.Log.w("AppMonitorService", "Blocking Settings app: $currentApp")
+                returnToLauncher()
+                return
+            }
+            
             val whitelist = getWhitelist(this)
-
+            
             if (!whitelist.contains(currentApp)) {
-                // Block this app - return to launcher
+                android.util.Log.w("AppMonitorService", "Blocking app: $currentApp")
                 returnToLauncher()
             }
         }
     }
+    
+    private fun isSettingsApp(packageName: String): Boolean {
+        val settingsPackages = listOf(
+            "com.android.settings",
+            "com.samsung.android.settings",
+            "com.miui.securitycenter",
+            "com.oneplus.settings",
+            "com.huawei.systemmanager",
+            "com.coloros.settings",
+            "com.oppo.settings",
+            "com.vivo.settings",
+            "com.realme.settings",
+            "com.xiaomi.settings"
+        )
+        return settingsPackages.any { packageName.startsWith(it, ignoreCase = true) } ||
+               packageName.contains("settings", ignoreCase = true)
+    }
 
     private fun getForegroundApp(): String? {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-            val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
-            val time = System.currentTimeMillis()
-
-            val usageEvents = usageStatsManager?.queryEvents(time - 1000, time)
-            val event = UsageEvents.Event()
-
-            var lastApp: String? = null
-            while (usageEvents?.hasNextEvent() == true) {
-                usageEvents.getNextEvent(event)
-                if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) {
-                    lastApp = event.packageName
+            return try {
+                // Check permission first to avoid system errors
+                if (!hasUsageStatsPermission()) {
+                    return null
                 }
+                
+                val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager
+                if (usageStatsManager == null) {
+                    return null
+                }
+                
+                val time = System.currentTimeMillis()
+                val usageEvents = usageStatsManager.queryEvents(time - 2000, time)
+                val event = UsageEvents.Event()
+
+                var lastApp: String? = null
+                var lastEventTime = 0L
+                
+                while (usageEvents.hasNextEvent()) {
+                    usageEvents.getNextEvent(event)
+                    if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+                        if (event.timeStamp > lastEventTime) {
+                            lastApp = event.packageName
+                            lastEventTime = event.timeStamp
+                        }
+                    }
+                }
+                
+                lastApp
+            } catch (e: SecurityException) {
+                // Permission not granted or package verification failed
+                android.util.Log.w("AppMonitorService", "SecurityException getting foreground app: ${e.message}")
+                null
+            } catch (e: Exception) {
+                // Handle any other exceptions gracefully
+                android.util.Log.w("AppMonitorService", "Error getting foreground app: ${e.message}")
+                null
             }
-            return lastApp
-        } else {
-            // Fallback for older Android versions
-            val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            val tasks = activityManager.getRunningTasks(1)
-            return tasks.firstOrNull()?.topActivity?.packageName
+        }
+        return null
+    }
+    
+    private fun hasUsageStatsPermission(): Boolean {
+        return try {
+            val appOps = getSystemService(Context.APP_OPS_SERVICE) as? android.app.AppOpsManager
+            if (appOps == null) {
+                return false
+            }
+            
+            val mode = appOps.checkOpNoThrow(
+                android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
+                android.os.Process.myUid(),
+                packageName
+            )
+            mode == android.app.AppOpsManager.MODE_ALLOWED
+        } catch (e: SecurityException) {
+            // Handle SecurityException gracefully - permission not granted or package not found
+            android.util.Log.w("AppMonitorService", "Error checking usage stats permission: ${e.message}")
+            false
+        } catch (e: Exception) {
+            // Handle any other exceptions
+            android.util.Log.w("AppMonitorService", "Unexpected error checking usage stats permission: ${e.message}")
+            false
         }
     }
 
